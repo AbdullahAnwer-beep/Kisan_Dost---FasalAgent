@@ -1,221 +1,230 @@
 """
-Function tools for the Kisan Dost Field Reminder Agent.
+Kisan Dost function tools.
 
-Each tool is small, typed, single-responsibility, and returns a
-Pydantic model (see models.py) instead of a loose string — this is
-what the hackathon brief calls "structured outputs" and it is what
-lets the frontend render a reminder card without parsing text.
+Each tool is a single-responsibility, typed @function_tool per the
+hackathon's technical checklist. Real weather comes from Open-Meteo
+(free, no API key) — everything else uses the hardcoded agronomy tables
+in data/crop_calendar.py, which is explicitly allowed by the rules.
 """
 
-from datetime import date, datetime
-from agents import function_tool
+from datetime import datetime, date
+import httpx
+from agents import function_tool, RunContextWrapper
 
-from data_store import load_crops, load_schemes
-from models import WaterAdvice, SowingAdvice, HarvestAdvice, GovtSupportAdvice
-from weather import get_rainfall_forecast_mm
+from .models import CropStage, IrrigationAdvice, SowingAdvice, HarvestAdvice, FarmerProfile
+from .data.crop_calendar import (
+    CROP_STAGES, HARVEST_DAYS, SOWING_WINDOWS, IRRIGATION_INTERVAL_DAYS,
+    CRITICAL_STAGES, normalize_crop,
+)
+
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 
 
-def _growth_stage(days_since_sowing: int, maturity_days: int) -> str:
-    fraction = days_since_sowing / maturity_days
-    if fraction < 0.15:
-        return "germination"
-    if fraction < 0.45:
-        return "vegetative"
-    if fraction < 0.65:
-        return "flowering"
-    if fraction < 0.9:
-        return "grain_fill"
-    return "maturity"
+def _days_since(sowing_date: str, today: date | None = None) -> int:
+    sowed = datetime.strptime(sowing_date, "%Y-%m-%d").date()
+    today = today or date.today()
+    return max((today - sowed).days, 0)
 
 
 @function_tool
-def check_irrigation_need(
-    crop: str,
-    district: str,
-    sowing_date: str,
-    last_irrigation_date: str,
-) -> WaterAdvice:
-    """Decide whether a field needs watering today.
+def get_crop_stage(crop: str, sowing_date: str) -> CropStage:
+    """Work out what growth stage a crop is in today.
 
     Args:
-        crop: Crop name, e.g. "wheat", "cotton", "rice", "maize", "sugarcane".
-        district: Farmer's district, used to fetch a real rainfall forecast.
-        sowing_date: ISO date (YYYY-MM-DD) the crop was sown.
-        last_irrigation_date: ISO date (YYYY-MM-DD) of the last irrigation.
+        crop: Crop name, e.g. 'wheat', 'cotton', 'rice', 'maize', 'sugarcane'.
+        sowing_date: The date the crop was sown, in YYYY-MM-DD format.
     """
-    crops = load_crops()
-    crop_key = crop.strip().lower()
-    if crop_key not in crops:
-        return WaterAdvice(
-            water_needed_today=False,
-            days_since_last_irrigation=0,
-            recommended_interval_days=0,
-            growth_stage="unknown",
-            rainfall_expected_mm_next_3_days=0.0,
-            reason=f"'{crop}' is not in the crop database yet, so no irrigation "
-                   f"advice can be given. Supported crops: {', '.join(crops.keys())}.",
+    crop_key = normalize_crop(crop)
+    stages = CROP_STAGES.get(crop_key)
+    if not stages:
+        return CropStage(
+            crop=crop, days_since_sowing=0, stage_name="unknown",
+            stage_number=0, total_stages=0, days_remaining_in_stage=0,
+            notes=f"No stage data for '{crop}' yet. Supported crops: {', '.join(CROP_STAGES)}.",
         )
 
-    today = date.today()
-    sowed = datetime.strptime(sowing_date, "%Y-%m-%d").date()
-    last_irrigated = datetime.strptime(last_irrigation_date, "%Y-%m-%d").date()
+    dso = _days_since(sowing_date)
+    running = 0
+    for i, (name, length) in enumerate(stages, start=1):
+        if dso <= running + length:
+            return CropStage(
+                crop=crop_key, days_since_sowing=dso, stage_name=name,
+                stage_number=i, total_stages=len(stages),
+                days_remaining_in_stage=running + length - dso,
+                notes=f"{crop_key.title()} is {dso} days old, in the '{name}' stage.",
+            )
+        running += length
 
-    days_since_sowing = (today - sowed).days
-    days_since_irrigation = (today - last_irrigated).days
-    stage = _growth_stage(days_since_sowing, crops[crop_key]["maturity_days"])
-    interval = crops[crop_key]["irrigation_interval_days"].get(stage, 14)
-
-    rainfall = get_rainfall_forecast_mm(district, days=3)
-    enough_rain_coming = rainfall >= 15.0
-
-    needs_water = days_since_irrigation >= interval and not enough_rain_coming
-
-    if enough_rain_coming:
-        reason = (
-            f"{rainfall}mm of rain is expected in {district} over the next 3 days, "
-            f"so irrigation can wait even though it has been {days_since_irrigation} "
-            f"days since the last watering."
-        )
-    elif needs_water:
-        reason = (
-            f"It has been {days_since_irrigation} days since the last irrigation, "
-            f"which is past the {interval}-day limit for the {stage} stage, and no "
-            f"significant rain ({rainfall}mm) is expected."
-        )
-    else:
-        reason = (
-            f"Only {days_since_irrigation} of the {interval} days between waterings "
-            f"for the {stage} stage have passed. No action needed yet."
-        )
-
-    return WaterAdvice(
-        water_needed_today=needs_water,
-        days_since_last_irrigation=days_since_irrigation,
-        recommended_interval_days=interval,
-        growth_stage=stage,
-        rainfall_expected_mm_next_3_days=rainfall,
-        reason=reason,
+    return CropStage(
+        crop=crop_key, days_since_sowing=dso, stage_name="Past maturity",
+        stage_number=len(stages), total_stages=len(stages),
+        days_remaining_in_stage=0,
+        notes=f"{crop_key.title()} has passed its normal growth cycle ({dso} days). Check harvest readiness.",
     )
 
 
 @function_tool
-def check_sowing_window(crop: str, season: str) -> SowingAdvice:
-    """Check whether today falls inside the recommended sowing window for a crop.
+def get_weather_forecast(district: str, latitude: float | None = None, longitude: float | None = None) -> str:
+    """Fetch today's real weather (temperature, humidity, rain chance) for a
+    Pakistani district using the free Open-Meteo API. Falls back to a plain
+    text note if the network call fails so the agent never crashes.
 
     Args:
-        crop: Crop name, e.g. "wheat", "cotton", "rice", "maize", "sugarcane".
-        season: "Rabi" or "Kharif".
+        district: District or city name, e.g. 'Multan', 'Faisalabad'.
+        latitude: Optional latitude if already known (skips geocoding).
+        longitude: Optional longitude if already known (skips geocoding).
     """
-    crops = load_crops()
-    crop_key = crop.strip().lower()
-    if crop_key not in crops:
+    try:
+        with httpx.Client(timeout=6.0) as client:
+            if latitude is None or longitude is None:
+                geo = client.get(GEOCODE_URL, params={"name": district, "count": 1, "country": "PK"})
+                geo.raise_for_status()
+                results = geo.json().get("results")
+                if not results:
+                    return f"Could not geocode '{district}'. Assume normal weather, no extreme heat or frost."
+                latitude, longitude = results[0]["latitude"], results[0]["longitude"]
+
+            fc = client.get(FORECAST_URL, params={
+                "latitude": latitude, "longitude": longitude,
+                "current": "temperature_2m,relative_humidity_2m",
+                "daily": "precipitation_sum,temperature_2m_max,temperature_2m_min",
+                "timezone": "auto", "forecast_days": 3,
+            })
+            fc.raise_for_status()
+            data = fc.json()
+            cur = data.get("current", {})
+            daily = data.get("daily", {})
+            rain_today = (daily.get("precipitation_sum") or [0])[0]
+            tmax = (daily.get("temperature_2m_max") or [None])[0]
+            tmin = (daily.get("temperature_2m_min") or [None])[0]
+            return (
+                f"District: {district}. Current temp: {cur.get('temperature_2m')}°C, "
+                f"humidity: {cur.get('relative_humidity_2m')}%. Today's forecast: "
+                f"max {tmax}°C / min {tmin}°C, expected rain {rain_today}mm."
+            )
+    except Exception as e:
+        return f"Weather service unavailable ({e}). Assume normal weather, no extreme heat, no rain expected."
+
+
+@function_tool
+def check_irrigation_need(
+    crop: str, sowing_date: str, soil_type: str, last_irrigation_days_ago: int, weather_summary: str,
+) -> IrrigationAdvice:
+    """Decide whether the field needs water TODAY.
+
+    Args:
+        crop: Crop name.
+        sowing_date: YYYY-MM-DD sowing date, used to find the current growth stage.
+        soil_type: One of 'clay', 'loamy', 'sandy', 'sandy-loam', or 'unknown'.
+        last_irrigation_days_ago: How many days ago the field was last irrigated.
+        weather_summary: Short text weather summary (from get_weather_forecast), used
+            to check for rain that would delay irrigation, or heat that speeds it up.
+    """
+    crop_key = normalize_crop(crop)
+    interval_table = IRRIGATION_INTERVAL_DAYS.get(crop_key, IRRIGATION_INTERVAL_DAYS["wheat"])
+    interval = interval_table.get(soil_type, interval_table["unknown"])
+
+    stage_info = get_crop_stage(crop_key, sowing_date)
+    is_critical_stage = stage_info.stage_name in CRITICAL_STAGES.get(crop_key, [])
+    if is_critical_stage:
+        interval = max(interval - 2, 2)  # tighter gap during flowering/tillering/etc.
+
+    rain_expected = any(tok in weather_summary.lower() for tok in ["rain", "mm"]) and \
+        any(c.isdigit() and int(c) > 3 for c in weather_summary if c.isdigit())
+    heatwave = "40" in weather_summary or "42" in weather_summary or "45" in weather_summary
+
+    overdue_by = last_irrigation_days_ago - interval
+
+    if rain_expected and overdue_by < 2:
+        return IrrigationAdvice(
+            needs_water_today=False, urgency="none",
+            reason="Meaningful rain is expected soon and the field is not badly overdue.",
+            recommended_action="Skip irrigation today. Recheck after the rain to see if it was enough.",
+            next_check_in_days=2,
+        )
+
+    if overdue_by >= 3 or (overdue_by >= 0 and is_critical_stage) or heatwave:
+        urgency = "critical" if overdue_by >= 5 else ("high" if is_critical_stage or heatwave else "medium")
+        return IrrigationAdvice(
+            needs_water_today=True, urgency=urgency,
+            reason=(
+                f"It has been {last_irrigation_days_ago} days since last irrigation; the normal gap for "
+                f"{crop_key} on {soil_type} soil is about {interval} days"
+                + (", and the crop is in a water-critical stage right now" if is_critical_stage else "")
+                + (". Hot weather is increasing water demand" if heatwave else "") + "."
+            ),
+            recommended_action="Irrigate the field today — do not delay further.",
+            next_check_in_days=interval,
+        )
+
+    return IrrigationAdvice(
+        needs_water_today=False, urgency="low" if overdue_by > -2 else "none",
+        reason=f"Only {last_irrigation_days_ago} of the usual {interval}-day gap has passed for {crop_key} on {soil_type} soil.",
+        recommended_action="No irrigation needed today. Check again in a few days.",
+        next_check_in_days=max(interval - last_irrigation_days_ago, 1),
+    )
+
+
+@function_tool
+def check_sowing_time(crop: str, district: str, season: str) -> SowingAdvice:
+    """Check whether NOW is a good time to sow a given crop.
+
+    Args:
+        crop: Crop name to sow.
+        district: District, used only for the response text (no location logic yet).
+        season: 'Rabi' or 'Kharif'.
+    """
+    crop_key = normalize_crop(crop)
+    windows = SOWING_WINDOWS.get(crop_key, {})
+    window = windows.get(season)
+    if not window:
         return SowingAdvice(
-            sowing_window_open=False,
-            window_start="-",
-            window_end="-",
-            days_remaining_in_window=None,
-            reason=f"'{crop}' is not in the crop database yet.",
+            is_good_time_to_sow=False, crop=crop_key, season=season,  # type: ignore[arg-type]
+            reason=f"No {season} sowing window is defined for {crop_key} in {district}.",
+            ideal_window="Not applicable",
         )
-
-    window = crops[crop_key]["sowing_window"]
-    today = date.today()
-    year = today.year
-    start = datetime.strptime(f"{year}-{window['start']}", "%Y-%m-%d").date()
-    end = datetime.strptime(f"{year}-{window['end']}", "%Y-%m-%d").date()
-
-    # Sowing windows that cross the new year (rare, but handle it safely).
-    if end < start:
-        end = end.replace(year=year + 1)
-        if today < start:
-            start = start.replace(year=year - 1)
-
-    is_open = start <= today <= end
-    days_remaining = (end - today).days if is_open else None
-
-    if is_open:
-        reason = (
-            f"Today falls inside the recommended {crop} sowing window "
-            f"({window['start']} to {window['end']}). {days_remaining} days left in the window."
-        )
-    elif today < start:
-        reason = f"The {crop} sowing window opens on {window['start']}. It is too early to sow yet."
-    else:
-        reason = f"The {crop} sowing window for this cycle closed on {window['end']}. It is too late for this season."
-
+    start_month, end_month = window
+    current_month = date.today().month
+    in_window = start_month <= current_month <= end_month
+    month_names = ["", "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+    window_text = f"{month_names[start_month]}-{month_names[end_month]}"
     return SowingAdvice(
-        sowing_window_open=is_open,
-        window_start=window["start"],
-        window_end=window["end"],
-        days_remaining_in_window=days_remaining,
-        reason=reason,
+        is_good_time_to_sow=in_window, crop=crop_key, season=season,  # type: ignore[arg-type]
+        reason=(
+            f"The ideal sowing window for {crop_key} ({season}) in Punjab-type conditions is {window_text}."
+            + (" You are inside that window now." if in_window else " You are currently outside that window.")
+        ),
+        ideal_window=window_text,
     )
 
 
 @function_tool
 def check_harvest_readiness(crop: str, sowing_date: str) -> HarvestAdvice:
-    """Check whether a field is ready, or close to ready, for harvest.
-
-    Args:
-        crop: Crop name, e.g. "wheat", "cotton", "rice", "maize", "sugarcane".
-        sowing_date: ISO date (YYYY-MM-DD) the crop was sown.
-    """
-    crops = load_crops()
-    crop_key = crop.strip().lower()
-    if crop_key not in crops:
-        return HarvestAdvice(
-            harvest_ready=False,
-            days_since_sowing=0,
-            maturity_days=0,
-            days_remaining=0,
-            reason=f"'{crop}' is not in the crop database yet.",
-        )
-
-    maturity_days = crops[crop_key]["maturity_days"]
-    sowed = datetime.strptime(sowing_date, "%Y-%m-%d").date()
-    days_since_sowing = (date.today() - sowed).days
-    days_remaining = maturity_days - days_since_sowing
-    ready = days_remaining <= 0
-
-    if ready:
-        reason = (
-            f"{days_since_sowing} days have passed since sowing, past the "
-            f"{maturity_days}-day maturity period for {crop}. The field should "
-            f"be checked for harvest."
-        )
-    elif days_remaining <= 10:
-        reason = f"Only {days_remaining} days remain until the typical {maturity_days}-day maturity for {crop}. Start preparing labour and storage."
-    else:
-        reason = f"{days_remaining} days remain until the typical maturity point for {crop}."
-
-    return HarvestAdvice(
-        harvest_ready=ready,
-        days_since_sowing=days_since_sowing,
-        maturity_days=maturity_days,
-        days_remaining=max(days_remaining, 0),
-        reason=reason,
-    )
-
-
-@function_tool
-def find_govt_support(crop: str, province: str) -> GovtSupportAdvice:
-    """Find government support schemes relevant to a crop and province.
+    """Check if a crop is ready to harvest, or how many days remain.
 
     Args:
         crop: Crop name.
-        province: Farmer's province, e.g. "Punjab", "Sindh".
+        sowing_date: YYYY-MM-DD sowing date.
     """
-    schemes = load_schemes()
-    crop_key = crop.strip().lower()
-    matches = [
-        s["name"]
-        for s in schemes
-        if (s["province"] in (province, "Federal"))
-        and ("all" in s["applies_to"] or crop_key in s["applies_to"])
-    ]
-    if matches:
-        reason = f"Found {len(matches)} scheme(s) relevant to {crop} growers in {province}."
-    else:
-        reason = f"No specific scheme found for {crop} in {province}; the federal ZTBL loan is generally available."
-        matches = ["Zarai Taraqiati Bank (ZTBL) Agri Loan"]
-
-    return GovtSupportAdvice(matching_schemes=matches, reason=reason)
+    crop_key = normalize_crop(crop)
+    total_days = HARVEST_DAYS.get(crop_key)
+    if not total_days:
+        return HarvestAdvice(
+            is_ready_to_harvest=False, days_to_harvest=-1,
+            reason=f"No harvest timeline available for '{crop}'.",
+            recommended_action="Consult your local agriculture extension office.",
+        )
+    dso = _days_since(sowing_date)
+    remaining = total_days - dso
+    if remaining <= 0:
+        return HarvestAdvice(
+            is_ready_to_harvest=True, days_to_harvest=0,
+            reason=f"{crop_key.title()} is {dso} days old; normal maturity is {total_days} days.",
+            recommended_action="Inspect the field and begin harvest — grain/boll moisture check recommended before cutting.",
+        )
+    return HarvestAdvice(
+        is_ready_to_harvest=False, days_to_harvest=remaining,
+        reason=f"{crop_key.title()} is {dso} of {total_days} days into its cycle.",
+        recommended_action=f"Not ready yet — check back in about {remaining} days.",
+    )

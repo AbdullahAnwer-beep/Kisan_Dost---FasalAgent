@@ -1,64 +1,76 @@
 """
-Structured data models for Kisan Dost — Field Reminder Agent.
+Structured output models for Kisan Dost.
 
-Every tool returns one of these typed models instead of loose text,
-so the agent's output is predictable and the frontend can render it
-without parsing free-form strings.
+Every tool and every agent returns one of these typed objects instead of
+loose text. This is what the hackathon brief calls out as the difference
+between a "Pass" build and a "Good" build.
 """
 
-from datetime import date
 from typing import Literal, Optional
 from pydantic import BaseModel, Field
 
 
 class FarmerProfile(BaseModel):
-    """The context object carried across a farmer's whole session."""
-    farmer_id: str
-    name: str
+    """Carried as typed context across the whole session so the farmer
+    never has to repeat district / land size / crop again."""
+    farmer_id: str = ""
+    name: str = "Farmer"
     district: str
-    province: str
+    province: Literal["Punjab", "Sindh", "KPK", "Balochistan", "Other"] = "Punjab"
     crop: str
-    season: Literal["Rabi", "Kharif"]
+    sowing_date: str  # ISO format YYYY-MM-DD
     land_acres: float
-    sowing_date: date
-    last_irrigation_date: date
+    soil_type: Literal["clay", "loamy", "sandy", "sandy-loam", "unknown"] = "unknown"
+    water_source: Literal["canal", "tube-well", "rain-fed", "unknown"] = "unknown"
 
 
-class WaterAdvice(BaseModel):
-    water_needed_today: bool
-    days_since_last_irrigation: int
-    recommended_interval_days: int
-    growth_stage: str
-    rainfall_expected_mm_next_3_days: float
+class CropStage(BaseModel):
+    crop: str
+    days_since_sowing: int
+    stage_name: str
+    stage_number: int
+    total_stages: int
+    days_remaining_in_stage: int
+    notes: str
+
+
+class IrrigationAdvice(BaseModel):
+    needs_water_today: bool
+    urgency: Literal["none", "low", "medium", "high", "critical"]
     reason: str
+    recommended_action: str
+    next_check_in_days: int
 
 
 class SowingAdvice(BaseModel):
-    sowing_window_open: bool
-    window_start: str
-    window_end: str
-    days_remaining_in_window: Optional[int]
+    is_good_time_to_sow: bool
+    crop: str
+    season: Literal["Rabi", "Kharif"]
     reason: str
+    ideal_window: str
 
 
 class HarvestAdvice(BaseModel):
-    harvest_ready: bool
-    days_since_sowing: int
-    maturity_days: int
-    days_remaining: int
+    is_ready_to_harvest: bool
+    days_to_harvest: int
     reason: str
+    recommended_action: str
 
 
-class GovtSupportAdvice(BaseModel):
-    matching_schemes: list[str]
+class DailyReminder(BaseModel):
+    """The single message shown to the farmer each day — the whole point
+    of the product."""
+    farmer_name: str
+    district: str
+    crop: str
+    date: str
+    headline: str
+    irrigation: IrrigationAdvice
+    stage: CropStage
+    harvest: Optional[HarvestAdvice] = None
+    extra_notes: list[str] = Field(default_factory=list)
+
+
+class GuardrailCheck(BaseModel):
+    is_allowed: bool
     reason: str
-
-
-class FieldAdvisory(BaseModel):
-    """The combined 'today's advisory slip' shown on the dashboard."""
-    farmer_id: str
-    generated_on: date
-    water: WaterAdvice
-    sowing: SowingAdvice
-    harvest: HarvestAdvice
-    govt_support: GovtSupportAdvice
